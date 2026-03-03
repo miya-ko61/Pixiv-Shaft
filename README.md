@@ -69,7 +69,7 @@
 
 [FAQ](./FAQ.md)
 
-## 7.Linux Go 后台服务开发文档
+## 7. Linux Go 后台服务开发文档
 
 [Pixiv Linux Go 后台服务 / CLI 开发文档](./README/GO_CLI_DEV_GUIDE.md)
 
