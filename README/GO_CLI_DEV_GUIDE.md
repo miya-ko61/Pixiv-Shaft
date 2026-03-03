@@ -152,25 +152,83 @@ x-client-hash: <hash(x-client-time + salt)>
 
 ---
 
-## 4. 登录与 Token 生命周期设计
+## 4. 登录逻辑深度分析（你开发 Go CLI 重点看这章）
 
-## 4.1 推荐登录策略（工程上最稳）
+这一章按“可直接实现”的标准写：你照着实现即可，不需要再读仓库源码。
+
+## 4.1 登录完整时序（OAuth + PKCE）
+
+```text
+[1] 生成 PKCE:
+    code_verifier (随机串) -> SHA256 -> code_challenge
+
+[2] 打开登录页:
+    https://app-api.pixiv.net/web/v1/login?code_challenge=...&code_challenge_method=S256&client=pixiv-android
+
+[3] 用户登录授权后回调:
+    https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback?code=AUTH_CODE
+
+[4] 用 code 换 token:
+    POST https://oauth.secure.pixiv.net/auth/token
+    grant_type=authorization_code
+    code=AUTH_CODE
+    code_verifier=步骤[1]原始值
+
+[5] 保存 token:
+    access_token + refresh_token + expires_in
+
+[6] 后续请求遇到 token 失效:
+    refresh_token -> 新 access_token
+```
+
+## 4.2 CLI 推荐登录策略（工程上最稳）
 
 因为 CLI 无 UI，建议采用以下方式之一：
 
 1. **方式 A（推荐）**：你手动登录一次拿到 `refresh_token`，写入配置；服务启动后仅走 refresh。
 2. 方式 B：实现完整 OAuth + PKCE（打开浏览器、回调本地端口）获取授权码，再换 token。
 
-## 4.2 Token 管理器接口
+如果你只追求稳定可用，先实现方式 A，再迭代方式 B。
 
-```go
-type TokenManager interface {
-    GetAccessToken(ctx context.Context) (string, error)
-    Refresh(ctx context.Context) (string, error)
-}
-```
+## 4.3 授权码换 token：请求细节（必须对齐）
 
-## 4.3 并发刷新防抖（必须）
+- URL：`POST https://oauth.secure.pixiv.net/auth/token`
+- Content-Type：`application/x-www-form-urlencoded`
+- 表单字段：
+  - `client_id`
+  - `client_secret`
+  - `grant_type=authorization_code`
+  - `code=<回调拿到的授权码>`
+  - `code_verifier=<生成PKCE时的原始verifier>`
+  - `redirect_uri=https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback`
+  - `include_policy=true`
+
+`code_verifier` 必须与当时生成 `code_challenge` 的那一个严格对应，否则会登录失败。
+
+## 4.4 refresh token 刷新：触发条件与策略
+
+你需要在请求层统一处理 token 失效，触发 refresh 的推荐条件：
+
+- HTTP `400` 且响应包含 OAuth/token 相关错误文本
+- 或 HTTP `401` 且业务可判定为 token 失效
+
+刷新请求：
+
+- URL：`POST https://oauth.secure.pixiv.net/auth/token`
+- 表单字段：
+  - `client_id`
+  - `client_secret`
+  - `grant_type=refresh_token`
+  - `refresh_token=<本地保存值>`
+  - `include_policy=true`
+
+刷新成功后必须立即：
+
+1. 更新内存 token
+2. 原子化写回磁盘（防进程重启丢失）
+3. 使用新 token 重试一次原请求
+
+## 4.5 并发刷新防抖（必须实现）
 
 场景：多个请求同时 400/401，不能并发打 N 次 refresh。
 
@@ -193,12 +251,65 @@ func (m *Manager) RefreshIfNeeded(oldToken string) (string, error) {
 }
 ```
 
-## 4.4 刷新失败处理
+## 4.6 登录请求头深度说明（风控关键）
 
-- 如果提示 refresh_token 无效：
-  - 记录 ERROR 日志
-  - 标记服务进入 `AUTH_BROKEN` 状态
-  - 退出并提示人工重新登录
+除 `Authorization` 外，建议统一注入以下头：
+
+```text
+User-Agent: PixivIOSApp/7.13.4 (iOS 16.0.3; iPhone13,3)
+accept-language: zh-CN
+app-os: ios
+app-version: 7.13.4
+x-client-time: <UTC ISO-8601>
+x-client-hash: <MD5(x-client-time + 固定salt)>
+```
+
+建议你实现：
+
+- `BuildClientTimeHeaders(now time.Time) (xClientTime, xClientHash string)`
+- HTTP 中间件统一注入，避免每个请求手写
+- `x-client-hash` 的 MD5 用法是为兼容接口协议，不是用于本地安全加密
+
+## 4.7 错误分支设计（必须覆盖）
+
+至少区分两类错误：
+
+1. **可恢复错误**（网络波动、临时 OAuth 失败）  
+   - 先 refresh（或退避重试）再重试原请求
+2. **不可恢复错误**（refresh_token 无效）  
+   - 进入 `AUTH_BROKEN` 状态
+   - 停止任务并提示人工重新登录
+
+不要无限重试 refresh，建议最多 1~2 次， 并使用指数退避（例如第 1 次等待 1s，第 2 次等待 2s）。
+
+## 4.8 Token 持久化规范（防损坏）
+
+推荐把 token 存在 `token.json`，写入使用“临时文件 + rename”原子替换：
+
+```go
+type StoredToken struct {
+    AccessToken  string    `json:"access_token"`
+    RefreshToken string    `json:"refresh_token"`
+    ExpireAt     time.Time `json:"expire_at"`
+    UpdatedAt    time.Time `json:"updated_at"`
+}
+```
+
+启动时加载策略：
+
+1. 文件不存在：报错并提示先登录
+2. 有 refresh_token：优先 refresh 获取新 access_token
+3. refresh 失败：退出并给出明确错误日志
+
+## 4.9 可直接抄用的 Go 接口骨架
+
+```go
+type TokenManager interface {
+    GetAccessToken(ctx context.Context) (string, error)
+    ExchangeCode(ctx context.Context, code, codeVerifier string) error
+    Refresh(ctx context.Context) (string, error)
+}
+```
 
 ---
 
