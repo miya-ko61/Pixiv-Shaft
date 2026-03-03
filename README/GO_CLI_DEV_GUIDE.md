@@ -1,226 +1,591 @@
-# Pixiv Linux Go 后台服务 / CLI 开发文档（基于 Pixiv-Shaft）
+# Pixiv 收藏自动下载器（Linux Go CLI）完整开发手册
 
-> 目标：实现一个运行在 Linux 的 Go 后台服务，登录后自动定时下载「收藏」原图到指定路径，带日志，并且保证去重不重复下载。
-
-## 1. 现有仓库可复用能力总览
-
-- 登录与 Token：
-  - `app/src/main/java/ceui/lisa/http/AccountApi.java`
-  - `app/src/main/java/ceui/lisa/http/AccountTokenApi.java`
-  - `app/src/main/java/ceui/lisa/http/TokenInterceptor.java`
-  - `app/src/main/java/ceui/pixiv/session/SessionManager.kt`
-  - `app/src/main/java/ceui/lisa/feature/HostManager.java`
-- Pixiv API 定义：
-  - `app/src/main/java/ceui/lisa/http/AppApi.java`
-- 下载与去重：
-  - `app/src/main/java/ceui/lisa/download/IllustDownload.java`
-  - `app/src/main/java/ceui/lisa/download/FileCreator.java`
-  - `app/src/main/java/ceui/lisa/utils/Common.java`
-  - `app/src/main/java/ceui/lisa/helper/DeduplicateArrayList.java`
-  - `app/src/main/java/ceui/lisa/database/DownloadEntity.java`
-- 日志：
-  - `app/src/main/java/ceui/lisa/utils/Common.java` (`showLog`)
-  - `app/src/main/java/ceui/lisa/http/Retro.java` / `ceui/loxia/Client.kt`（HTTP 日志拦截）
+> 本文是**可独立开发**的说明书。你只看这份文档，不看任何仓库源码，也可以从 0 实现一个 Linux 后台 Go CLI：
+>
+> - 登录后自动获取/刷新 token
+> - 定时扫描 Pixiv 收藏（Bookmarks）
+> - 下载完整原图到指定路径
+> - 全程结构化日志
+> - 多层去重（不能重复下载）
 
 ---
 
-## 2. 登录流程与 Token 流程梳理
+## 0. 免责声明与合规边界（必须先看）
 
-## 2.1 OAuth + PKCE 登录流程
-
-1. 生成 PKCE：
-   - `HostManager.getPkce()` 内调用 `PkceUtil.generateCodeVerifier()` / `generateCodeChallenge()`
-2. 生成登录 URL：
-   - `HostManager.getLoginUrl()` → `https://app-api.pixiv.net/web/v1/login?...`
-3. 用户网页登录后回调：
-   - `OutWakeActivity` 处理 `pixiv://account/login?code=...`
-4. 用授权码换 Token：
-   - `AccountApi.newLogin(...)`（`grant_type=authorization_code`）
-5. 本地持久化与会话更新：
-   - `Local.saveUser(...)`
-   - `SessionManager.updateSession(...)`
-
-对应关键参数常量：
-- `FragmentLogin.CLIENT_ID`
-- `FragmentLogin.CLIENT_SECRET`
-- `FragmentLogin.AUTH_CODE`
-- `FragmentLogin.CALL_BACK`
-
-## 2.2 Token 刷新流程
-
-- 触发点：
-  - Java 旧链路：`TokenInterceptor` 遇到 400 且响应包含 `Error occurred at the OAuth process`
-  - Kotlin 新链路：`TokenFetcherInterceptor` 遇到同类 token 错误
-- 刷新接口：
-  - `AccountTokenApi.newRefreshToken(...)` / `newRefreshToken2(...)`
-  - `grant_type=refresh_token`
-- 并发控制：
-  - Java：`TokenInterceptor.getNewToken(...)` 使用 `synchronized`
-  - Kotlin：`SessionManager.refreshAccessToken(...)` 使用 `Mutex` + `Deferred`
+1. 本文仅用于技术学习与个人非商业用途。
+2. 你下载的作品版权归原作者所有，请遵守当地法律法规与平台条款。
+3. 不要在公开仓库提交任何账户 token、cookie、client secret。
+4. 默认实现应控制请求频率，避免对目标服务造成压力。
 
 ---
 
-## 3. Pixiv 相关 API（Go 端重点）
+## 1. 目标系统定义
 
-核心定义在 `AppApi.java`，Go CLI 最常用接口：
+你要实现一个可长期运行的 `pixivd`：
 
-- 收藏列表（重点）：
-  - `GET v1/user/bookmarks/illust`
-  - 方法：`getUserLikeIllust(...)`
-- 收藏标签（可选）：
-  - `GET v1/user/bookmark-tags/illust`
-- 收藏详情（可选）：
-  - `GET v2/illust/bookmark/detail`
-- 分页：
-  - 普遍返回 `next_url`，仓库中通过 `getNextIllust(...)` 等方法继续拉取
-
-建议 Go 端先实现最小闭环：
-1. 登录/refresh 获取 access token  
-2. 拉取书签插画分页  
-3. 提取原图 URL 下载落盘  
-4. 记录状态并定时重复
+- 运行环境：Linux（建议 systemd 托管）
+- 运行模式：
+  - 前台执行（调试）
+  - 守护执行（生产）
+- 核心职责：
+  1. 拿到 access_token（首次登录 / refresh）
+  2. 定时拉取收藏插画列表（含分页）
+  3. 解析每张图原图 URL（单图/多图）
+  4. 去重并下载文件到本地
+  5. 写入状态库与日志
 
 ---
 
-## 4. 下载、命名、去重机制梳理
+## 2. 术语与数据模型
 
-## 4.1 原图 URL 选取
+## 2.1 术语
 
-- `IllustDownload.getUrl(...)` 最终从：
-  - 单图：`meta_single_page.original_image_url`
-  - 多图：`meta_pages[i].image_urls.original`
+- `access_token`：调用 Pixiv API 的短期令牌
+- `refresh_token`：用于换新 `access_token` 的长期令牌
+- `illust`：插画对象
+- `page`：多图作品中的第几张（`p0/p1/...`）
+- `next_url`：分页下一页 URL
 
-## 4.2 命名策略
+## 2.2 最小数据结构（Go）
 
-- `FileCreator.customFileName(...)` 按配置拼接：标题、作品 ID、页码、作者等
-- `FileCreator.deleteSpecialWords(...)` 清理文件名特殊字符
+```go
+type AccountToken struct {
+    AccessToken  string `json:"access_token"`
+    RefreshToken string `json:"refresh_token"`
+    ExpiresIn    int64  `json:"expires_in"`
+    TokenType    string `json:"token_type"`
+}
 
-推荐 Go 端稳定命名模板（避免重复）：
-- `illust_{illust_id}_p{page_index}.{ext}`
+type IllustListResp struct {
+    Illusts []Illust `json:"illusts"`
+    NextURL string   `json:"next_url"`
+}
 
-## 4.3 去重策略（必须）
+type Illust struct {
+    ID         int64  `json:"id"`
+    Title      string `json:"title"`
+    PageCount  int    `json:"page_count"`
+    CreateDate string `json:"create_date"`
 
-仓库里已有两类去重思想：
+    MetaSinglePage struct {
+        OriginalImageURL string `json:"original_image_url"`
+    } `json:"meta_single_page"`
 
-1. **集合去重**：`DeduplicateArrayList`（按 `getDuplicateKey()`）
-2. **文件存在性去重**：
-   - `Common.isIllustDownloaded(...)`
-   - `FileCreator.isExist(...)` / `SAFile.isFileExists(...)`
+    MetaPages []struct {
+        ImageURLs struct {
+            Original string `json:"original"`
+            Large    string `json:"large"`
+            Medium   string `json:"medium"`
+        } `json:"image_urls"`
+    } `json:"meta_pages"`
 
-Go 服务建议采用“三层去重”：
-
-1. **任务层**：内存 `map[string]struct{}`，key=`illustID_page`
-2. **文件层**：目标文件已存在则跳过
-3. **状态层**：SQLite/BoltDB 记录成功下载（`illustID,page,url_hash,path,download_at`）
-
----
-
-## 5. 代理/绕过代理能力梳理
-
-已有能力：
-
-- `HostManager.replaceUrl(...)`
-  - `isUsePixivCat()` 时将 `i.pximg.net` 改为 `i.pixiv.re`
-  - `isAutoFuckChina()` 时可替换为 IP 直连（HTTP）
-- `HostManager.updateHost()` 通过 DoH（Cloudflare / DNSSB）更新可用 IP
-- `Retro.fuckChinaWithConfig(...)` 可启用自定义 DNS + SSL 策略
-
-Go 服务建议：
-
-1. 默认支持系统代理：
-   - `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`
-2. 可选配置自定义代理：
-   - `proxy_url: socks5://...` 或 `http://...`
-3. 可选镜像/域名替换：
-   - 与 `HostManager.replaceUrl(...)` 等价
-4. 可选 DNS over HTTPS：
-   - 仅在默认解析失败时启用
-
----
-
-## 6. 保活 / 定时任务 / 后台服务建议
-
-仓库中不存在标准 Linux daemon，但有队列与任务执行思路：
-
-- `ceui/lisa/feature/worker/Worker.java`：串行任务执行
-- `ceui/pixiv/ui/task/*`：协程任务与队列管理
-
-Go 端建议：
-
-1. `systemd` 方式托管进程（推荐）
-2. 服务内 ticker 周期执行：
-   - 例如每 5~15 分钟扫描收藏增量
-3. 每轮执行流程：
-   - refresh token（必要时）→ 拉取分页 → 去重 → 下载 → 持久化状态
-4. 失败重试：
-   - 网络错误指数退避（1s/2s/4s/... 上限）
-   - 401/400 token 错误优先 refresh 后重试一次
-
----
-
-## 7. 日志建议（对应“含有日志”要求）
-
-仓库现状：
-
-- `Common.showLog(...)` → `Log.d("==SHAFT==>", ...)`
-- OkHttp `HttpLoggingInterceptor` 记录请求/响应
-
-Go 服务建议日志字段化（JSON）：
-
-- `time`, `level`, `msg`
-- `task_id`, `illust_id`, `page`, `url`, `file_path`
-- `http_status`, `retry`, `error`
-
-最少应有四类日志：
-1. 登录与 token 刷新
-2. 每轮定时任务开始/结束与统计
-3. 单文件下载成功/跳过/失败
-4. 异常与重试
-
----
-
-## 8. Go CLI 推荐模块设计（可直接落地）
-
-- `cmd/pixivd/main.go`：启动入口
-- `internal/config`：YAML/ENV 配置
-- `internal/auth`：PKCE、登录、token 刷新
-- `internal/api`：Pixiv 接口封装（bookmarks、next_url）
-- `internal/downloader`：并发下载与限速
-- `internal/dedup`：去重（内存+DB+文件）
-- `internal/store`：状态持久化（SQLite/BoltDB）
-- `internal/scheduler`：定时轮询
-- `internal/logx`：结构化日志
-
-建议配置项：
-
-```yaml
-download_dir: /data/pixiv/bookmarks
-scan_interval: 10m
-concurrency: 4
-proxy_url: ""
-replace_pximg_host: ""
-request_timeout: 20s
-retry_max: 3
+    User struct {
+        ID   int64  `json:"id"`
+        Name string `json:"name"`
+    } `json:"user"`
+}
 ```
 
 ---
 
-## 9. 最小可用实现路径（MVP）
+## 3. API 端点与请求规范（可直接实现）
 
-1. 手动登录一次，保存 refresh_token
-2. 服务启动先 refresh 获取 access_token
-3. 拉取 `v1/user/bookmarks/illust` 全分页
-4. 解析每个 illust 的原图 URL（含多页）
-5. 按 `illustID_page` 去重后下载
-6. 定时重复第 2~5 步
-7. 输出轮次统计日志（新增/跳过/失败数量）
+## 3.1 OAuth token 接口
+
+- Host: `https://oauth.secure.pixiv.net`
+- 路径: `POST /auth/token`
+- Content-Type: `application/x-www-form-urlencoded`
+
+### 3.1.1 授权码换 token
+
+字段：
+
+- `client_id`
+- `client_secret`
+- `grant_type=authorization_code`
+- `code`
+- `code_verifier`
+- `redirect_uri`
+- `include_policy=true`
+
+### 3.1.2 refresh token 换新 access token
+
+字段：
+
+- `client_id`
+- `client_secret`
+- `grant_type=refresh_token`
+- `refresh_token`
+- `include_policy=true`
+
+## 3.2 应用 API Host
+
+- `https://app-api.pixiv.net`
+
+## 3.3 收藏列表接口（核心）
+
+- `GET /v1/user/bookmarks/illust`
+- 常见参数：
+  - `user_id=<当前用户ID>`
+  - `restrict=public|private`（按需要）
+  - `max_bookmark_id=<分页用，可选>`
+  - `tag=<标签过滤，可选>`
+
+## 3.4 分页接口
+
+- 推荐：直接请求响应里的 `next_url`
+- 你需要把 `next_url` 原样作为下一次 GET URL
+
+## 3.5 请求头（关键）
+
+```text
+Authorization: Bearer <access_token>
+User-Agent: PixivIOSApp/7.13.4 (iOS 16.0.3; iPhone13,3)
+accept-language: zh-CN
+app-os: ios
+app-version: 7.13.4
+x-client-time: <UTC time>
+x-client-hash: <hash(x-client-time + salt)>
+```
+
+> 说明：`x-client-time` 与 `x-client-hash` 是常见风控字段。建议你在实现中封装 HeaderBuilder，每次请求动态生成。
 
 ---
 
-## 10. 风险与注意事项
+## 4. 登录与 Token 生命周期设计
 
-1. 本仓库含明文客户端参数（`CLIENT_ID/CLIENT_SECRET`），Go 独立服务建议改为配置注入，不要硬编码。
-2. 代理与域名替换能力可能受网络环境、证书策略和目标站点策略变化影响，需要可开关配置。
-3. 下载去重不要只依赖文件名，建议同时记录 `illustID+page` 唯一键。
-4. API 风控（频率限制）需要控制并发与请求间隔。
+## 4.1 推荐登录策略（工程上最稳）
 
+因为 CLI 无 UI，建议采用以下方式之一：
+
+1. **方式 A（推荐）**：你手动登录一次拿到 `refresh_token`，写入配置；服务启动后仅走 refresh。
+2. 方式 B：实现完整 OAuth + PKCE（打开浏览器、回调本地端口）获取授权码，再换 token。
+
+## 4.2 Token 管理器接口
+
+```go
+type TokenManager interface {
+    GetAccessToken(ctx context.Context) (string, error)
+    Refresh(ctx context.Context) (string, error)
+}
+```
+
+## 4.3 并发刷新防抖（必须）
+
+场景：多个请求同时 400/401，不能并发打 N 次 refresh。
+
+做法：
+
+- 用 `sync.Mutex` 或 `singleflight.Group`
+- 双重检查：进入锁后再次判断 token 是否已被其它协程刷新
+
+伪代码：
+
+```go
+func (m *Manager) RefreshIfNeeded(oldToken string) (string, error) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    if m.currentAccessToken != oldToken && m.currentAccessToken != "" {
+        return m.currentAccessToken, nil
+    }
+    return m.refreshLocked()
+}
+```
+
+## 4.4 刷新失败处理
+
+- 如果提示 refresh_token 无效：
+  - 记录 ERROR 日志
+  - 标记服务进入 `AUTH_BROKEN` 状态
+  - 退出并提示人工重新登录
+
+---
+
+## 5. 下载对象解析与落盘规则
+
+## 5.1 原图 URL 解析规则
+
+- `page_count == 1`：取 `meta_single_page.original_image_url`
+- `page_count > 1`：遍历 `meta_pages[i].image_urls.original`
+
+## 5.2 文件扩展名
+
+从 URL 最后一个 `.` 后缀取扩展名（`jpg/png/webp/...`）。
+若解析失败，默认 `jpg`。
+
+## 5.3 文件命名规则（建议固定）
+
+建议使用稳定、可逆、不会冲突的命名：
+
+```text
+illust_{illustID}_p{pageIndex}.{ext}
+```
+
+示例：
+
+- `illust_116457142_p0.jpg`
+- `illust_116457142_p1.jpg`
+
+## 5.4 目录结构建议
+
+```text
+/data/pixiv/bookmarks/
+  ├── images/
+  │   ├── 2026-03/
+  │   └── 2026-04/
+  ├── state/
+  │   ├── pixiv.db
+  │   └── token.json
+  └── logs/
+      └── pixivd.log
+```
+
+---
+
+## 6. 去重设计（必须实现三层）
+
+你要求“不能重复下载”，建议三层同时启用：
+
+## 6.1 层 1：任务内去重（内存）
+
+- key：`illustID_page`
+- 作用：同一轮扫描中避免重复入队
+
+```go
+key := fmt.Sprintf("%d_%d", illustID, pageIndex)
+if _, ok := taskSeen[key]; ok { skip }
+taskSeen[key] = struct{}{}
+```
+
+## 6.2 层 2：文件存在性去重
+
+- 如果目标路径文件已存在，直接跳过
+- 适合“服务重启后继续”场景
+
+## 6.3 层 3：状态库去重（推荐 SQLite）
+
+表建议：
+
+```sql
+CREATE TABLE IF NOT EXISTS downloaded_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  illust_id INTEGER NOT NULL,
+  page_index INTEGER NOT NULL,
+  url_hash TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  file_size INTEGER DEFAULT 0,
+  downloaded_at TEXT NOT NULL,
+  UNIQUE(illust_id, page_index)
+);
+```
+
+查询逻辑：
+
+- 若 `(illust_id, page_index)` 已存在 => 跳过
+- 下载成功后插入；失败不插入
+
+---
+
+## 7. 定时任务与保活
+
+## 7.1 调度器
+
+- 使用 `time.Ticker` 每 `scan_interval` 执行一轮
+- 每轮流程：
+
+```text
+refresh token(必要时)
+  -> 拉取收藏第一页
+  -> while next_url != "": 拉下一页
+  -> 生成下载任务
+  -> 去重
+  -> 并发下载
+  -> 写入状态库
+  -> 输出轮次统计日志
+```
+
+## 7.2 并发下载
+
+- worker pool：`concurrency` 建议 2~6
+- 每个下载任务独立超时（如 30s）
+
+## 7.3 重试策略
+
+- 网络错误：指数退避（1s/2s/4s，最多 3 次）
+- 429/5xx：可重试
+- 401/400 token 错误：先 refresh 再重试一次
+
+---
+
+## 8. 代理、网络与可达性
+
+## 8.1 代理配置
+
+支持两种来源：
+
+1. 环境变量：`HTTP_PROXY/HTTPS_PROXY/NO_PROXY`
+2. 配置文件：`proxy_url`
+
+## 8.2 域名替换（可选）
+
+某些网络环境可对 `i.pximg.net` 做可配置替换（如镜像域名或特定入口）。
+
+实现建议：
+
+```go
+func replaceImageHost(rawURL, newHost string) string
+```
+
+## 8.3 DNS 策略（可选）
+
+- 默认系统 DNS
+- 失败时降级到 DoH（可配置）
+
+---
+
+## 9. 日志标准（可直接用于 ELK/Loki）
+
+## 9.1 字段规范
+
+```json
+{
+  "time": "2026-03-03T06:30:00Z",
+  "level": "INFO",
+  "msg": "download_success",
+  "task_id": "scan-20260303-0630",
+  "illust_id": 116457142,
+  "page": 0,
+  "file_path": "/data/pixiv/bookmarks/images/2026-03/illust_116457142_p0.jpg",
+  "duration_ms": 842,
+  "retry": 1
+}
+```
+
+## 9.2 最少日志事件
+
+1. `service_start`
+2. `token_refresh_success` / `token_refresh_failed`
+3. `scan_started` / `scan_finished`
+4. `download_queued`
+5. `download_success`
+6. `download_skipped_duplicate`
+7. `download_failed`
+
+---
+
+## 10. 配置文件模板（生产可用）
+
+`config.yaml`：
+
+```yaml
+pixiv:
+  oauth_host: "https://oauth.secure.pixiv.net"
+  api_host: "https://app-api.pixiv.net"
+  client_id: ""
+  client_secret: ""
+  refresh_token: ""
+
+runtime:
+  download_dir: "/data/pixiv/bookmarks/images"
+  state_db: "/data/pixiv/bookmarks/state/pixiv.db"
+  token_store: "/data/pixiv/bookmarks/state/token.json"
+  scan_interval: "10m"
+  concurrency: 4
+  request_timeout: "30s"
+  retry_max: 3
+
+network:
+  proxy_url: ""
+  replace_pximg_host: ""
+  enable_doh_fallback: false
+
+log:
+  level: "info"
+  format: "json"
+  file: "/data/pixiv/bookmarks/logs/pixivd.log"
+```
+
+---
+
+## 11. 推荐项目结构（可直接创建）
+
+```text
+pixivd/
+  ├── cmd/pixivd/main.go
+  ├── internal/config/
+  ├── internal/logx/
+  ├── internal/auth/
+  ├── internal/api/
+  ├── internal/downloader/
+  ├── internal/dedup/
+  ├── internal/store/
+  ├── internal/scheduler/
+  ├── internal/service/
+  ├── migrations/
+  ├── config.example.yaml
+  └── Makefile
+```
+
+---
+
+## 12. 核心流程伪代码（端到端）
+
+```go
+func runOneRound(ctx context.Context) error {
+    token, err := tokenManager.GetAccessToken(ctx)
+    if err != nil { return err }
+
+    all := []ImageTask{}
+    nextURL := api.BuildBookmarksURL()
+
+    for nextURL != "" {
+        resp, err := api.GetBookmarks(ctx, token, nextURL)
+        if isAuthError(err) {
+            token, err = tokenManager.Refresh(ctx)
+            if err != nil { return err }
+            resp, err = api.GetBookmarks(ctx, token, nextURL)
+        }
+        if err != nil { return err }
+
+        tasks := parseOriginalImageTasks(resp.Illusts)
+        all = append(all, tasks...)
+        nextURL = resp.NextURL
+    }
+
+    queued := dedup.Filter(all) // 内存 + 文件 + DB
+    return downloader.DownloadAll(ctx, queued)
+}
+```
+
+---
+
+## 13. systemd 部署模板
+
+`/etc/systemd/system/pixivd.service`
+
+```ini
+[Unit]
+Description=Pixiv Bookmark Downloader Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pixiv
+Group=pixiv
+WorkingDirectory=/opt/pixivd
+ExecStart=/opt/pixivd/pixivd --config /etc/pixivd/config.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+Environment=TZ=Asia/Shanghai
+
+[Install]
+WantedBy=multi-user.target
+```
+
+常用命令：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pixivd
+sudo systemctl start pixivd
+sudo systemctl status pixivd
+journalctl -u pixivd -f
+```
+
+---
+
+## 14. 开发顺序（建议按此落地）
+
+1. 建项目骨架 + 配置加载 + 日志
+2. 实现 refresh token 换 access token
+3. 实现 bookmarks 拉取（含分页）
+4. 实现任务解析（单图/多图）
+5. 实现文件下载
+6. 实现三层去重
+7. 接入 scheduler + worker pool
+8. 增加系统信号处理（优雅退出）
+9. 接入 systemd 与监控
+
+---
+
+## 15. 验收标准（Definition of Done）
+
+满足以下条件才算完成：
+
+1. 服务启动后可自动拉取收藏并下载原图
+2. 重启服务后不会重复下载旧文件
+3. 定时轮询稳定运行 24h 无崩溃
+4. token 过期后能自动刷新并继续任务
+5. 网络抖动场景下有重试且日志可追踪
+6. 日志可统计每轮：发现数/新增数/跳过数/失败数
+
+---
+
+## 16. 故障排查手册
+
+## 16.1 现象：全部 401/400
+
+- 检查 refresh token 是否失效
+- 检查请求头 Authorization 是否为 `Bearer <token>`
+- 检查本机时间是否漂移（影响签名时间相关头）
+
+## 16.2 现象：列表有数据但无下载
+
+- 检查去重逻辑是否误判（UNIQUE 键冲突）
+- 检查下载目录权限
+- 检查 URL 解析是不是拿到了 non-original URL
+
+## 16.3 现象：频繁超时
+
+- 减小并发
+- 提高 timeout
+- 配置代理或更换网络出口
+
+## 16.4 现象：下载重复
+
+- 确认三层去重都启用了
+- 检查 state DB 是否被清空或路径变动
+- 检查 key 是否稳定（必须 `illustID_page`）
+
+---
+
+## 17. 安全建议（生产）
+
+1. token/secret 放在：
+   - `/etc/pixivd/config.yaml` + 600 权限，或
+   - 环境变量 + Secret 管理系统
+2. 禁止在日志打印完整 token
+3. 对下载文件名做路径清理，防止目录穿越
+4. 限制单文件最大大小，避免磁盘打满
+
+---
+
+## 18. 你可以直接照抄的最小命令行设计
+
+```bash
+pixivd run --config /etc/pixivd/config.yaml
+pixivd once --config ./config.yaml
+pixivd doctor --config ./config.yaml
+pixivd migrate --dsn /data/pixiv/bookmarks/state/pixiv.db
+```
+
+- `run`：守护模式，定时循环
+- `once`：执行单轮，便于调试
+- `doctor`：检查 token/目录/数据库/网络
+- `migrate`：初始化数据库表
+
+---
+
+## 19. 最后结论
+
+如果你只按本文实现，不看任何源码，也可以完成一个可用的 Linux Go CLI 服务。实现成败最关键的 4 点是：
+
+1. Token 自动刷新 + 并发防抖
+2. 收藏分页完整拉取
+3. 三层去重严格执行
+4. 可观测日志 + 可恢复重试
+
+做到这四点，你的“自动定时下载收藏完整图片且不重复”的目标就能稳定达成。
