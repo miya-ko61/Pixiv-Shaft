@@ -1,220 +1,301 @@
-# Pixiv-Shaft Token 刷新与保活机制深度分析
+# Pixiv-Shaft Token 刷新与保活实现文档（面向只看 Markdown 开发）
 
-> 面向「二次开发新 CLI/服务端」的实现文档。  
-> 目标：不读源码也能理解原项目如何处理 token 失效、自动刷新、并发防抖与会话保活。
-
----
-
-## 1. 总览：原项目如何做 token 保活
-
-当前代码主链路（新实现）：
-
-1. 请求统一经过 `HeaderInterceptor` 注入认证头与风控头。
-2. 请求返回后由 `TokenFetcherInterceptor` 判断是否是 token 失效错误。
-3. 命中失效条件时调用 `SessionManager.refreshAccessToken(tokenForThisRequest)`。
-4. `SessionManager` 内通过 **Mutex + 双检查 + Deferred 复用** 防止并发重复刷新。
-5. 刷新成功后更新会话并重试原请求；失败则返回原响应或进入重新登录流程。
-
-对应文件：
-
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/HeaderInterceptor.kt`
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/TokenFetcherInterceptor.kt`
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/pixiv/session/SessionManager.kt`
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/Client.kt`
+> 这份文档是“实现规格”，目标是：你不看任何项目源码，也能在新 CLI/服务里完整复刻 token 自动刷新与保活流程。
 
 ---
 
-## 2. 触发刷新的条件（何时判定 token 失效）
+## 0. 你要实现的能力（先看这一段）
 
-在 `TokenFetcherInterceptor.intercept()` 中：
+你最终需要具备 6 个能力：
 
-- 先执行原请求，拿到 `response`；
-- 当 `response.code == 400` 时，读取 body；
-- 若 body 包含以下任一文本，进入刷新流程：
-  - `Error occurred at the OAuth process`
-  - `Invalid refresh token`
-
-错误常量来自：
-
-- `ClientManager.TOKEN_ERROR_1`
-- `ClientManager.TOKEN_ERROR_2`
-
-定义位置：
-
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/Client.kt`
+1. 每次业务请求都带上认证头与保活头。
+2. 当接口返回“token 失效”特征时，自动触发 refresh。
+3. 多并发请求下只允许一次真实 refresh（防止 token 刷新风暴）。
+4. refresh 成功后自动重放原请求。
+5. refresh 失败后进入“需要重新登录”状态。
+6. 整个流程可观测（日志与状态机清晰）。
 
 ---
 
-## 3. refresh token 请求到底携带了哪些变量
+## 1. 术语与基础常量
 
-刷新接口定义在：
+### 1.1 Host
 
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/http/AccountTokenApi.java`
+- App API Host: `https://app-api.pixiv.net`
+- OAuth Host: `https://oauth.secure.pixiv.net`
 
-方法：`newRefreshToken2(...)`  
-HTTP：`POST /auth/token`（OAuth Host：`https://oauth.secure.pixiv.net`）
+### 1.2 OAuth 关键常量（实现时必须提供）
 
-### 3.1 请求字段（Form URL Encoded）
+- `CLIENT_ID = <YOUR_CLIENT_ID>`
+- `CLIENT_SECRET = <YOUR_CLIENT_SECRET>`
+- `GRANT_TYPE_REFRESH = refresh_token`
+- `GRANT_TYPE_AUTH_CODE = authorization_code`
+- `REDIRECT_URI = https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback`
+- `TOKEN_HEAD = Bearer `（注意有空格）
 
-| 字段名 | 值来源 | 说明 |
-|---|---|---|
-| `client_id` | `FragmentLogin.CLIENT_ID` | 客户端标识 |
-| `client_secret` | `FragmentLogin.CLIENT_SECRET` | 客户端密钥 |
-| `grant_type` | `FragmentLogin.REFRESH_TOKEN`（值为 `refresh_token`） | OAuth 刷新模式 |
-| `refresh_token` | `_loggedInAccount.value?.refresh_token` | 登录后保存的 refresh token |
-| `include_policy` | `true` | 接口扩展参数 |
+> 安全提示：建议通过环境变量或密钥管理注入，不要硬编码到公开仓库。  
+> 若你需要对齐本仓库默认实现，可从以下文件读取当前常量：  
+> `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/fragments/FragmentLogin.kt`
 
-实际调用位置：
+### 1.3 Token 失效判定文本
 
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/pixiv/session/SessionManager.kt`
-- 函数：`refreshAccessTokenInternal(refreshToken: String)`
+当响应状态码是 `400`，并且响应体包含任一文本时，视为 token 失效：
 
-### 3.2 关键常量值（保活时必须保持一致）
-
-定义位置：
-
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/fragments/FragmentLogin.kt`
-
-当前使用值：
-
-- `CLIENT_ID = "<见 FragmentLogin.CLIENT_ID>"`
-- `CLIENT_SECRET = "<见 FragmentLogin.CLIENT_SECRET>"`
-- `REFRESH_TOKEN = "refresh_token"`
-- `AUTH_CODE = "authorization_code"`
-- `CALL_BACK = "https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback"`
-
-> 安全提示：以上常量是“兼容原协议”的对照信息。你在新项目中不应把这些值硬编码进公开仓库，建议通过环境变量或密钥管理系统注入。
+- `Error occurred at the OAuth process`
+- `Invalid refresh token`
 
 ---
 
-## 4. 登录换 token 请求（与 refresh 对照）
+## 2. refresh token 请求到底携带哪些变量
 
-同样是 `POST /auth/token`，但字段不同：
+### 2.1 请求定义
 
-| 字段名 | 用途 |
-|---|---|
-| `client_id` | 客户端标识 |
-| `client_secret` | 客户端密钥 |
-| `grant_type=authorization_code` | 授权码模式 |
-| `code` | 回调 URL 带回的授权码 |
-| `code_verifier` | PKCE verifier（必须与 challenge 对应） |
-| `redirect_uri` | 回调地址（`CALL_BACK`） |
-| `include_policy=true` | 扩展参数 |
+- Method: `POST`
+- URL: `https://oauth.secure.pixiv.net/auth/token`
+- Content-Type: `application/x-www-form-urlencoded`
 
-调用位置：
+### 2.2 字段字典（必须带齐）
 
-- `SessionManager.loginWithUrl(uri, block)`
+| 字段名 | 类型 | 必填 | 固定/动态 | 说明 |
+|---|---|---|---|---|
+| `client_id` | string | 是 | 固定 | 客户端 ID |
+| `client_secret` | string | 是 | 固定 | 客户端 Secret |
+| `grant_type` | string | 是 | 固定 | 必须为 `refresh_token` |
+| `refresh_token` | string | 是 | 动态 | 来自当前会话存储 |
+| `include_policy` | bool | 是 | 固定 | 固定 `true` |
 
----
+### 2.3 请求示例（可直接抄）
 
-## 5. 并发刷新如何防抖（核心保活能力）
+```bash
+curl -X POST 'https://oauth.secure.pixiv.net/auth/token' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'client_id=<YOUR_CLIENT_ID>' \
+  --data-urlencode 'client_secret=<YOUR_CLIENT_SECRET>' \
+  --data-urlencode 'grant_type=refresh_token' \
+  --data-urlencode 'refresh_token=<YOUR_REFRESH_TOKEN>' \
+  --data-urlencode 'include_policy=true'
+```
 
-`SessionManager.refreshAccessToken(tokenForThisRequest)` 的并发控制分 3 层：
+### 2.4 响应后你必须做的事
 
-1. **快速检查（锁外）**  
-   若当前最新 token 已经不同于请求时 token，直接返回，不刷新。
+拿到刷新响应后至少更新：
 
-2. **Mutex 串行化（锁内）**  
-   `tokenRefreshMutex.withLock { ... }`，同一时刻仅一个刷新临界区。
-
-3. **双检查 + 任务复用**  
-   - 锁内再次比较 token，避免重复刷新；
-   - `refreshingTokenJob: Deferred<String?>` 复用进行中的刷新任务；
-   - 其他并发请求 `await()` 同一任务结果。
-
-这样可避免“10 个并发请求同时失效 -> 刷 10 次 token”的雪崩。
-
----
-
-## 6. 刷新失败分支（会发生什么）
-
-### 6.1 新链路（TokenFetcherInterceptor + SessionManager）
-
-- `refresh_token` 不存在：抛 `RuntimeException("refresh_token not exist")`
-- 刷新响应 body 为空：抛 `RuntimeException("newRefreshToken failed")`
-- 拦截器层捕获异常后：
-  - 若拿不到新 token，返回原响应（不重试）
-  - 由上层决定是否要求重新登录
-
-### 6.2 旧链路（TokenInterceptor.java）
-
-旧拦截器中对 `Invalid refresh token` 有更激进处理：
-
-- 标记用户未登录
-- 清理会话
-- 提示并重启应用
-
-文件：
-
-- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/http/TokenInterceptor.java`
+- `access_token`
+- `refresh_token`（有些场景服务端会旋转）
+- `expires_in` / `expire_at`
+- 用户信息快照（如你有这部分模型）
 
 ---
 
-## 7. 保活相关请求头（非常关键）
+## 3. 请求保活头（每次请求都要）
 
-请求头注入点：
+业务请求建议统一注入如下头：
 
-- `HeaderInterceptor.addHeader(...)`
-
-每次请求会加：
-
-- `authorization: Bearer <access_token>`（需要 token 的 API）
-- `accept-language`
+- `authorization: Bearer <access_token>`（仅需鉴权 API）
+- `accept-language: <按你的语言策略>`
 - `app-os: ios`
 - `app-version: 7.13.4`
 - `user-agent: PixivIOSApp/7.13.4 (iOS 16.0.3; iPhone13,3)`
-- `x-client-time`
-- `x-client-hash`
+- `x-client-time: <当前时间>`
+- `x-client-hash: <MD5(time + SALT)>`
 
-`x-client-time` / `x-client-hash` 生成逻辑在：
+### 3.1 x-client-time 生成
 
+格式：`yyyy-MM-dd'T'HH:mm:ssZZZZZ`
+
+例：`2026-03-05T14:03:12+08:00`
+
+### 3.2 x-client-hash 生成
+
+- `SALT = <YOUR_X_CLIENT_HASH_SALT>`
+- 拼接：`plain = x_client_time + SALT`
+- 计算：`x_client_hash = md5(plain)`（小写十六进制 32 位）
+
+> 注意：MD5 不安全，这里是“协议兼容”用途，不建议用于新的安全设计。
+> 若你需要对齐本仓库默认实现，可从以下文件读取当前 SALT：  
+> `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/PixivHeaders.kt`
+
+---
+
+## 4. 自动刷新触发与重放流程（时序版）
+
+### 4.1 正常流程
+
+1. 发送请求（带 access token）。
+2. 若返回非 token 失效，直接返回结果。
+
+### 4.2 token 失效流程
+
+1. 收到 `HTTP 400`。
+2. 响应体命中失效文本。
+3. 从原请求头取出 `tokenForThisRequest`（去掉 `Bearer ` 前缀）。
+4. 调用 `refreshAccessToken(tokenForThisRequest)`。
+5. 刷新成功后，用新 token 重建请求并重放一次。
+6. 把重放结果返回上层。
+
+---
+
+## 5. 并发刷新防抖（最关键）
+
+核心原则：**同一时刻最多一次真实 refresh 请求**。
+
+你可以按下面的三层结构实现：
+
+### 层 1：锁外快速检查
+
+- 读取当前缓存 token：`currentAccessToken`
+- 如果 `currentAccessToken != tokenForThisRequest`，说明别的请求已刷新成功，直接返回 `currentAccessToken`
+
+### 层 2：互斥锁串行
+
+- 使用一个全局锁（如 Go `sync.Mutex`）进入临界区
+
+### 层 3：锁内双检查 + in-flight 任务复用
+
+- 进入锁后再比较一次 token（双检查）
+- 若确实还没刷新：
+  - 启动一个刷新任务（future/promise/goroutine result）
+  - 其他并发请求等待同一个任务结果
+
+这样能避免“10 个并发失败请求触发 10 次 refresh”。
+
+---
+
+## 6. 状态机（建议照着做）
+
+定义 5 个状态：
+
+- `AUTH_OK`：token 可用
+- `AUTH_REFRESHING`：正在刷新
+- `AUTH_RETRYING`：已刷新，正在重放原请求
+- `AUTH_BROKEN`：refresh 失败，需要用户重新登录
+- `AUTH_LOGGED_OUT`：用户主动退出
+
+状态迁移：
+
+- `AUTH_OK -> AUTH_REFRESHING`：命中失效判定
+- `AUTH_REFRESHING -> AUTH_RETRYING`：refresh 成功
+- `AUTH_RETRYING -> AUTH_OK`：重放成功
+- `AUTH_REFRESHING -> AUTH_BROKEN`：refresh 失败
+- `AUTH_BROKEN -> AUTH_OK`：用户重新登录成功
+
+---
+
+## 7. 失败分支与处理策略
+
+### 7.1 refresh_token 不存在
+
+- 直接判定不可恢复，进入 `AUTH_BROKEN`
+
+### 7.2 refresh 接口返回空/异常
+
+- 记录错误日志（含 request id）
+- 不要无限重试
+- 建议最多 1~2 次指数退避
+- 最终失败进入 `AUTH_BROKEN`
+
+### 7.3 命中 `Invalid refresh token`
+
+- 视为 refresh token 已失效
+- 清空本地会话
+- 引导重新登录
+
+---
+
+## 8. 可直接实现的伪代码（语言无关）
+
+```text
+function sendWithAutoRefresh(request):
+    attachHeaders(request)
+    response = http.send(request)
+
+    if not isTokenExpired(response):
+        return response
+
+    oldToken = extractBearerToken(request.Authorization)
+    newToken = refreshAccessTokenWithDedup(oldToken)
+
+    if newToken is null:
+        markAuthBroken()
+        return response
+
+    retryReq = clone(request)
+    retryReq.Authorization = "Bearer " + newToken
+    return http.send(retryReq)
+```
+
+```text
+function refreshAccessTokenWithDedup(tokenForThisRequest):
+    current = session.accessToken
+    if current != tokenForThisRequest:
+        return current
+
+    lock(refreshMutex)
+    defer unlock(refreshMutex)
+
+    current = session.accessToken
+    if current != tokenForThisRequest:
+        return current
+
+    # isCompleted 表示该任务已结束（无论成功/失败），可创建新任务
+    if refreshingJob is nil or refreshingJob.isCompleted:
+        refreshingJob = async doRefreshHttpCall()
+
+    result = await refreshingJob
+    if result.success:
+        session.update(result.tokens)
+        return result.accessToken
+    else:
+        return null
+```
+
+---
+
+## 9. 登录换 token（和 refresh 的区别）
+
+初次登录使用授权码模式（不是 refresh 模式）：
+
+- `grant_type=authorization_code`
+- 额外需要：
+  - `code`
+  - `code_verifier`（PKCE）
+  - `redirect_uri`
+
+而 refresh 模式只需要：
+
+- `grant_type=refresh_token`
+- `refresh_token`
+
+---
+
+## 10. 排错清单（按优先级）
+
+1. **总是 400**：检查是否命中失效文本，避免把普通 400 当 token 失效。
+2. **refresh 成功但仍 401/400**：确认重放请求用了“新 token”。
+3. **偶发并发失败**：检查是否真的只有一个刷新 in-flight。
+4. **hash 错误**：检查时间格式、时区、SALT、MD5 小写输出。
+5. **refresh 循环**：限制最大刷新重试次数，失败进入 `AUTH_BROKEN`。
+
+---
+
+## 11. 最小落地清单（CLI 可执行）
+
+- [ ] 会话存储：`access_token / refresh_token / expire_at`
+- [ ] 请求拦截器：统一注入 headers
+- [ ] 失效判定器：`400 + 关键错误文本`
+- [ ] 刷新器：`POST /auth/token` + 字段齐全
+- [ ] 并发去重：锁 + 双检查 + in-flight 任务复用
+- [ ] 请求重放：刷新成功后重发原请求
+- [ ] 失败降级：进入 `AUTH_BROKEN` 并提示重新登录
+
+---
+
+## 12. 来源索引（便于后续人工核对）
+
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/TokenFetcherInterceptor.kt`
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/pixiv/session/SessionManager.kt`
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/http/AccountTokenApi.java`
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/HeaderInterceptor.kt`
 - `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/PixivHeaders.kt`
-
-计算方式：
-
-1. `x-client-time = 当前时间(yyyy-MM-dd'T'HH:mm:ssZZZZZ)`
-2. `x-client-hash = MD5(x-client-time + SALT)`
-3. `SALT = 28c1fdd170a5204386cb1313c7077b34f83e4aaf4aa829ce78c231e05b0bae2c`
-
-> 注意：MD5 已被证明不安全，这里仅用于兼容现有接口协议，不应用于新安全设计。
-> 若后续协议允许，优先改为服务端下发或配置化管理；该 SALT 在新实现中应按敏感配置处理，避免在公开仓库硬编码。
-
----
-
-## 8. 新 CLI 迁移建议（按原策略保活）
-
-如果你在新项目（例如 `pixiv` 或你自己的 CLI）复刻保活机制，建议最小实现：
-
-1. Token 存储结构：
-   - `access_token`
-   - `refresh_token`
-   - `expire_at`
-2. 请求拦截器：
-   - 注入 `Authorization` 和 `x-client-*` 头
-3. 失效检测：
-   - 先兼容原逻辑：HTTP 400 + OAuth 错误文本
-4. 并发刷新：
-   - `sync.Mutex` + 双检查；或 `singleflight.Group`
-5. 刷新重试：
-   - 最多 1~2 次指数退避
-6. 刷新失败：
-   - 进入 `AUTH_BROKEN`，停止自动任务并提示重新登录
-
----
-
-## 9. 关键源码索引（便于二次核对）
-
-- `SessionManager.refreshAccessToken`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/pixiv/session/SessionManager.kt`
-- `SessionManager.refreshAccessTokenInternal`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/pixiv/session/SessionManager.kt`
-- `TokenFetcherInterceptor.intercept`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/TokenFetcherInterceptor.kt`
-- `AccountTokenApi.newRefreshToken2 / newLogin`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/http/AccountTokenApi.java`
-- `HeaderInterceptor.addHeader`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/HeaderInterceptor.kt`
-- `RequestNonce.build`  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/PixivHeaders.kt`
-- `FragmentLogin` 常量（client_id/client_secret/grant_type/callback）  
-  `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/fragments/FragmentLogin.kt`
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/lisa/fragments/FragmentLogin.kt`
+- `/home/runner/work/Pixiv-Shaft/Pixiv-Shaft/app/src/main/java/ceui/loxia/Client.kt`
